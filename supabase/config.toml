@@ -1,0 +1,4 @@
+project_id = "trening-app"
+
+[functions.invite-client]
+verify_jwt = true

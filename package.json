@@ -16,6 +16,7 @@
     "recharts": "^3.10.1"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
     "@vitejs/plugin-react": "^6.1.2",
     "autoprefixer": "^10.6.1",
     "postcss": "^8.5.29",

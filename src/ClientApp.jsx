@@ -5,6 +5,8 @@ import { storeGet, storeSet } from "./lib/storage";
 import { supabase } from "./lib/supabaseClient";
 import { getClientNutrition } from "./lib/profiles";
 import { getTrainingProgram, getTrainingPrograms } from "./lib/training_programs";
+import { getWorkoutReports, submitWorkoutReport } from "./lib/workout_reports";
+import { createNotification } from "./lib/notifications";
 import AttendanceCalendar from "./AttendanceCalendar";
 import { DAYS, DAY_SHORT, todayIndex, isoMonday, formatWeekRange, localDateId, addCalendarMonth, dateIdFromTimestamp, emptyWeek, newExercise, youtubeEmbed, compressImage, Panel, Header, WeightHistory, Btn, inputCls } from "./AppShared";
 
@@ -29,7 +31,7 @@ export default function ClientApp({ me, onLogout }) {
       storeGet(`bodylog-${me.id}`),
       storeGet(`photos-${me.id}`),
       supabase.from("profiles").select("id").eq("role", "admin").limit(1).maybeSingle(),
-      storeGet(`reports-${me.id}`),
+      getWorkoutReports(me.id),
       storeGet(`membership-${me.id}`),
     ]);
     const weeks = progs || [];
@@ -40,9 +42,9 @@ export default function ClientApp({ me, onLogout }) {
           ...currentWeek,
           days: currentWeek.days.map((day, dayIdx) => {
             const report = (savedReports || []).find(
-              (item) => item.weekId === currentWeekId && item.dayIdx === dayIdx
+              (item) => item.week_start === currentWeekId && item.day_index === dayIdx
             );
-            return report ? { ...day, submittedAt: report.date } : day;
+            return report ? { ...day, submittedAt: report.submitted_at } : day;
           }),
         }
       : null;
@@ -53,7 +55,7 @@ export default function ClientApp({ me, onLogout }) {
     setAdminId(adminRow?.data?.id || null);
     setMembership(savedMembership);
     const submittedDates = new Set([
-      ...(savedReports || []).map((report) => dateIdFromTimestamp(report.date)),
+      ...(savedReports || []).map((report) => report.workout_date),
       ...weeks.flatMap((week) => week.days.flatMap((day) =>
         day.submittedAt ? [dateIdFromTimestamp(day.submittedAt)] : []
       )),
@@ -114,54 +116,29 @@ export default function ClientApp({ me, onLogout }) {
     }));
     const submittedAt = new Date().toISOString();
     const submittedDate = localDateId(new Date(submittedAt));
-    const reportId = `${me.id}-${weekId}-${dayIdx}-${submittedDate}`;
-
-    const reportsKey = `reports-${me.id}`;
-    const existingReports = await storeGet(reportsKey) || [];
-    const report = {
-      id: reportId,
-      clientId: me.id,
-      clientName: me.name,
+    const savedReport = await submitWorkoutReport(
+      me.id,
       weekId,
       dayIdx,
-      date: submittedAt,
-      day: day.day,
-      exercises: submittedExercises,
-    };
-    const updatedReports = [report, ...existingReports.filter((item) => item.id !== reportId)];
-    if (!await storeSet(reportsKey, updatedReports)) {
+      day.day,
+      submittedDate,
+      submittedExercises
+    );
+    if (!savedReport) {
       return { ok: false, error: "Nije moguće sačuvati izveštaj. Proveri vezu i pokušaj ponovo." };
     }
 
-    const notificationKey = `notifications-${me.id}`;
-    const list = await storeGet(notificationKey) || [];
-    const notificationId = reportId;
-    const summary = report.exercises.map((e) => {
+    const summary = submittedExercises.map((e) => {
       const actual = e.done
         ? `${e.actualWeight || e.weight}kg × ${e.actualReps || "ponavljanja nisu uneta"} pon.`
         : "nije odrađeno";
       return `${e.name}: ${actual}${e.note ? ` (napomena: ${e.note})` : ""}`;
     }).join("; ");
-    const notification = {
-      id: notificationId,
-      client: me.name,
-      date: new Date().toISOString(),
-      message: `${me.name} je predao/la izveštaj o treningu (${day.day}). ${summary}`,
-      read: false,
-    };
-    const updatedNotifications = [notification, ...list.filter((item) => item.id !== notificationId)];
-    if (!await storeSet(notificationKey, updatedNotifications)) {
-      const reportsRollbackSucceeded = await storeSet(
-        reportsKey,
-        existingReports.filter((item) => item.id !== reportId)
-      );
-      return {
-        ok: false,
-        error: reportsRollbackSucceeded
-          ? "Nije moguće poslati obaveštenje treneru. Proveri vezu i pokušaj ponovo."
-          : "Slanje nije uspelo i vraćanje svih podataka nije potvrđeno. Javi treneru da proveri rezultate.",
-      };
-    }
+    const notification = await createNotification(
+      adminId,
+      savedReport.id,
+      `${me.name} je predao/la izveštaj o treningu (${day.day}). ${summary}`
+    );
     setProgram({
       ...w,
       days: w.days.map((existingDay, index) =>
@@ -169,7 +146,18 @@ export default function ClientApp({ me, onLogout }) {
       ),
     });
     setAttendanceDates((current) => [...new Set([...current, dateIdFromTimestamp(submittedAt)])]);
-    return { ok: true };
+    let notificationWarning = null;
+    if (!notification.ok) {
+      const error = notification.error;
+      console.error("Workout report was saved but its notification failed", error);
+      notificationWarning = error.code === "42501"
+        ? "Trening je sačuvan, ali Supabase je odbio upis obaveštenja (RLS). Proveri INSERT politiku za notifications."
+        : `Trening je sačuvan, ali obaveštenje nije upisano${error.message ? `: ${error.message}` : "."}`;
+    }
+    return {
+      ok: true,
+      warning: notificationWarning,
+    };
   }
 
   async function addBodylog(entry) {
@@ -317,6 +305,7 @@ function ClientDayDetail({ program, dayIdx, locked, exerciseUpdates, onUpdateExe
   const [openVideo, setOpenVideo] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const [submitWarning, setSubmitWarning] = useState("");
   const submittedToday = day?.submittedAt
     ? dateIdFromTimestamp(day.submittedAt) === localDateId()
     : false;
@@ -327,10 +316,12 @@ function ClientDayDetail({ program, dayIdx, locked, exerciseUpdates, onUpdateExe
 
   async function handleSubmit() {
     setSubmitError("");
+    setSubmitWarning("");
     setSubmitting(true);
     try {
       const result = await onSubmit(dayIdx);
       if (!result.ok) setSubmitError(result.error);
+      else setSubmitWarning(result.warning || "");
     } catch (error) {
       console.error("Workout report submission failed", error);
       setSubmitError("Došlo je do greške pri slanju. Proveri vezu i pokušaj ponovo.");
@@ -445,9 +436,10 @@ function ClientDayDetail({ program, dayIdx, locked, exerciseUpdates, onUpdateExe
       {!locked && (
         <div className="mt-4">
           {submittedToday ? (
-            <p className="rounded-xl border border-green-200 bg-green-50 p-3 text-center text-sm font-bold text-green-800">
-              Izveštaj o treningu je poslat treneru.
-            </p>
+            <div className="rounded-xl border border-green-200 bg-green-50 p-3 text-center text-sm font-bold text-green-800">
+              <p>Izveštaj o treningu je sačuvan.</p>
+              {submitWarning && <p role="status" className="mt-1 font-medium text-amber-800">{submitWarning}</p>}
+            </div>
           ) : (
             <>
               {submitError && <p role="alert" className="mb-2 text-sm font-semibold text-red-700">{submitError}</p>}

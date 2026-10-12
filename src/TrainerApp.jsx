@@ -5,6 +5,8 @@ import { storeGet, storeSet } from "./lib/storage";
 import { getClientNutrition, updateClientNutritionPlan } from "./lib/profiles";
 import { supabase } from "./lib/supabaseClient";
 import { getTrainingProgram, getTrainingPrograms, saveTrainingProgram } from "./lib/training_programs";
+import { getWorkoutReports, deleteWorkoutReport } from "./lib/workout_reports";
+import { getNotifications, deleteNotifications } from "./lib/notifications";
 import Field from "./Field";
 import AttendanceCalendar from "./AttendanceCalendar";
 import { DAYS, DAY_SHORT, todayIndex, isoMonday, formatWeekRange, localDateId, addCalendarMonth, dateIdFromTimestamp, emptyWeek, newExercise, youtubeEmbed, compressImage, Panel, Header, WeightHistory, Btn, inputCls } from "./AppShared";
@@ -14,6 +16,7 @@ export default function TrainerApp({ me, onLogout }) {
   const [clients, setClients] = useState([]);
   const [clientSearch, setClientSearch] = useState("");
   const [selectedClient, setSelectedClient] = useState(null);
+  const [notificationTarget, setNotificationTarget] = useState(null);
   const [tab, setTab] = useState("program");
   const [section, setSection] = useState("clients");
   const [notifications, setNotifications] = useState([]);
@@ -28,25 +31,57 @@ export default function TrainerApp({ me, onLogout }) {
   const [inviteSuccess, setInviteSuccess] = useState("");
   const [sendingInvite, setSendingInvite] = useState(false);
   const [notificationError, setNotificationError] = useState("");
+  const [notificationBusy, setNotificationBusy] = useState(false);
   const [loading, setLoading] = useState(true);
 
   async function loadAll() {
-    const [{ data: cl }, n] = await Promise.all([
+    const [{ data: cl }, currentUserNotifications] = await Promise.all([
       supabase.from("profiles").select("id, name").eq("role", "client").order("name"),
-      storeGet(`notifications-${me.id}`),
+      getNotifications(),
     ]);
     const clientList = cl || [];
-    const clientNotifications = await Promise.all(
-      clientList.map((client) => storeGet(`notifications-${client.id}`))
-    );
     setClients(clientList);
-    setNotifications(
-      [...(n || []), ...clientNotifications.flatMap((items) => items || [])]
-        .sort((a, b) => new Date(b.date) - new Date(a.date))
-    );
+    if (currentUserNotifications === null) {
+      setNotificationError("Notifikacije nisu mogle da se učitaju.");
+      setNotifications([]);
+    } else {
+      setNotifications(currentUserNotifications);
+    }
     setLoading(false);
   }
   useEffect(() => { loadAll(); }, []);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel(`trainer-notifications-${me.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "notifications",
+          filter: `recipient_id=eq.${me.id}`,
+        },
+        ({ new: notification }) => {
+          setNotifications((current) => {
+            if (current.some((item) => item.id === notification.id)) return current;
+            return [notification, ...current].sort(
+              (a, b) => new Date(b.created_at) - new Date(a.created_at)
+            );
+          });
+        }
+      )
+      .subscribe((status, error) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.error("Trainer notification subscription failed", error);
+          setNotificationError("Obaveštenja uživo nisu dostupna. Osveži panel obaveštenja.");
+        }
+      });
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [me.id]);
 
   async function inviteClient(event) {
     event.preventDefault();
@@ -104,51 +139,66 @@ export default function TrainerApp({ me, onLogout }) {
     await loadAll();
   }
 
-  const unread = notifications.filter((n) => !n.read).length;
+  const unread = showNotifs ? 0 : notifications.length;
   const filteredClients = clients.filter((client) =>
     (client.name || "").toLocaleLowerCase("sr-RS").includes(clientSearch.trim().toLocaleLowerCase("sr-RS"))
   );
 
-  async function markAllRead() {
-    const updated = notifications.map((n) => ({ ...n, read: true }));
-    const writes = await Promise.all([
-      ...clients.map(async (client) => {
-        const key = `notifications-${client.id}`;
-        const items = await storeGet(key) || [];
-        return storeSet(key, items.map((item) => ({ ...item, read: true })));
-      }),
-      storeSet(`notifications-${me.id}`, updated.filter((item) => !clients.some((client) => item.id.startsWith(`${client.id}-`)))),
-    ]);
-    if (writes.some((success) => !success)) {
-      setNotificationError("Neka obaveštenja nisu mogla biti ažurirana. Pokušaj ponovo.");
+  async function toggleNotifications() {
+    if (showNotifs) {
+      setShowNotifs(false);
+      setNotifications([]);
       return;
     }
+
     setNotificationError("");
-    setNotifications(updated);
+    setShowNotifs(true);
+    setNotificationBusy(true);
+    const latestNotifications = await getNotifications();
+    if (latestNotifications === null) {
+      setNotificationError("Notifikacije nisu mogle da se učitaju. Pokušaj ponovo.");
+      setNotificationBusy(false);
+      return;
+    }
+
+    setNotifications(latestNotifications);
+    if (latestNotifications.length > 0) {
+      const deletedNotifications = await deleteNotifications(latestNotifications.map((item) => item.id));
+      if (deletedNotifications === null) {
+        setNotificationError("Notifikacije su učitane, ali nisu mogle biti obrisane.");
+      }
+    }
+    setNotificationBusy(false);
+  }
+
+  function openNotification(notification) {
+    if (!notification.workout_report_id || !notification.sender_id) {
+      setNotificationError("Ova notifikacija nema povezani izveštaj.");
+      return;
+    }
+    setNotificationTarget({
+      reportId: notification.workout_report_id,
+      clientId: notification.sender_id,
+    });
+    setSelectedClient(notification.sender_id);
+    setSection("reports");
+    setShowNotifs(false);
+    setNotifications([]);
   }
 
   async function resetWorkoutReport(report) {
-    const clientId = report.clientId;
+    const clientId = report.clientId || report.client_id;
     if (!clientId || !clients.some((client) => client.id === clientId)) {
       return { ok: false, error: "Nije pronađen klijent za ovaj izveštaj." };
     }
 
-    const reportIdParts = report.id.startsWith(`${clientId}-`)
-      ? report.id.slice(clientId.length + 1).split("-")
-      : [];
-    const weekId = report.weekId || reportIdParts.slice(0, 3).join("-");
-    const dayIdx = Number.isInteger(report.dayIdx) ? report.dayIdx : Number(reportIdParts[3]);
+    const weekId = report.weekId || report.week_start;
+    const dayIdx = report.dayIdx ?? report.day_index;
     if (!weekId || !Number.isInteger(dayIdx) || dayIdx < 0 || dayIdx >= DAYS.length) {
       return { ok: false, error: "Ne mogu pouzdano da pronađem dan treninga za reset." };
     }
 
-    const reportsKey = `reports-${clientId}`;
-    const notificationsKey = `notifications-${clientId}`;
-    const [storedProgram, storedReports, storedNotifications] = await Promise.all([
-      getTrainingProgram(clientId, weekId),
-      storeGet(reportsKey),
-      storeGet(notificationsKey),
-    ]);
+    const storedProgram = await getTrainingProgram(clientId, weekId);
     if (!storedProgram) return { ok: false, error: "Nije moguće učitati program za ovaj izveštaj." };
 
     const program = {
@@ -157,7 +207,8 @@ export default function TrainerApp({ me, onLogout }) {
     };
     const day = program.days?.[dayIdx];
     if (!day) return { ok: false, error: "Dan treninga za ovaj izveštaj više ne postoji." };
-    if (day.submittedAt && report.date && day.submittedAt !== report.date) {
+    const reportDate = report.workout_date || dateIdFromTimestamp(report.date || report.submitted_at);
+    if (day.submittedAt && reportDate && dateIdFromTimestamp(day.submittedAt) !== reportDate) {
       return { ok: false, error: "Izveštaj ne odgovara više trenutnom predatom treningu." };
     }
 
@@ -167,32 +218,25 @@ export default function TrainerApp({ me, onLogout }) {
       return { ...plannedExercise, done: false, note: "" };
     });
 
-    const previousReports = storedReports || [];
-    const previousNotifications = storedNotifications || [];
-    const nextReports = previousReports.filter((item) => item.id !== report.id);
-    const nextNotifications = previousNotifications.filter((item) => item.id !== report.id);
     const savedProgram = await saveTrainingProgram(clientId, weekId, program);
     if (!savedProgram) {
       return { ok: false, error: "Reset nije sačuvan. Pokušaj ponovo." };
     }
-    const writes = await Promise.all([
-      storeSet(reportsKey, nextReports),
-      storeSet(notificationsKey, nextNotifications),
-    ]);
-    if (writes.some((success) => !success)) {
-      const rollbacks = await Promise.all([
-        saveTrainingProgram(clientId, weekId, storedProgram),
-        storeSet(reportsKey, previousReports),
-        storeSet(notificationsKey, previousNotifications),
-      ]);
-      return {
-        ok: false,
-        error: rollbacks.every(Boolean)
-          ? "Reset nije sačuvan. Pokušaj ponovo."
-          : "Reset nije uspeo, a vraćanje svih podataka nije potvrđeno. Proveri stanje u bazi.",
-      };
+
+    if (report.isPersisted) {
+      const deleted = await deleteWorkoutReport(report.id);
+      if (!deleted) {
+        const rolledBack = await saveTrainingProgram(clientId, weekId, storedProgram);
+        return {
+          ok: false,
+          error: rolledBack
+            ? "Izveštaj nije obrisan iz baze, trening je vraćen na prethodno stanje."
+            : "Izveštaj nije obrisan, a vraćanje programa nije potvrđeno. Proveri stanje u bazi.",
+        };
+      }
     }
-    setNotifications((current) => current.filter((item) => item.id !== report.id));
+
+    setNotifications((current) => current.filter((item) => item.workout_report_id !== report.id));
     return { ok: true };
   }
 
@@ -205,7 +249,7 @@ export default function TrainerApp({ me, onLogout }) {
           <span className="app-brand-icon"><Dumbbell size={18} /></span> {me.name} <span className="text-[10px] font-normal opacity-60">(trener)</span>
         </div>
         <div className="flex items-center gap-3">
-          <button className="app-icon-button relative" onClick={() => setShowNotifs(!showNotifs)} aria-label="Obaveštenja">
+          <button className="app-icon-button relative" onClick={toggleNotifications} aria-label="Obaveštenja" disabled={notificationBusy}>
             <Bell size={18} />
             {unread > 0 && <span className="absolute -top-2 -right-2 bg-[#E14B4B] text-[10px] rounded-full w-4 h-4 flex items-center justify-center">{unread}</span>}
           </button>
@@ -218,16 +262,23 @@ export default function TrainerApp({ me, onLogout }) {
           <Panel className="p-3">
             <div className="flex justify-between items-center mb-2">
               <Header>Obaveštenja</Header>
-              {unread > 0 && <button onClick={markAllRead} className="text-xs font-bold text-[#2F6FB0]">Označi sve pročitano</button>}
             </div>
             {notificationError && <p role="alert" className="mb-2 text-xs font-bold text-red-700">{notificationError}</p>}
+            {notificationBusy && <p className="mb-2 text-xs text-neutral-500">Učitavanje notifikacija...</p>}
             {notifications.length === 0 && <p className="text-xs text-neutral-400 font-mono">Nema obaveštenja.</p>}
             <div className="space-y-2 max-h-64 overflow-y-auto">
               {notifications.map((n) => (
-                <div key={n.id} className={`text-xs p-2 rounded-lg ${n.read ? "bg-neutral-50 text-neutral-500" : "bg-neutral-100 font-bold"}`}>
+                <button
+                  key={n.id}
+                  type="button"
+                  onClick={() => openNotification(n)}
+                  disabled={notificationBusy}
+                  className="w-full rounded-lg bg-neutral-100 p-2 text-left text-xs font-bold hover:bg-neutral-200"
+                >
                   <p>{n.message}</p>
-                  <p className="text-[10px] text-neutral-400 mt-0.5">{new Date(n.date).toLocaleString("sr-RS")}</p>
-                </div>
+                  <p className="mt-0.5 text-[10px] font-normal text-neutral-400">{new Date(n.created_at).toLocaleString("sr-RS")}</p>
+                  <p className="mt-1 text-[10px] font-semibold text-[#2F6FB0]">Otvori izveštaj</p>
+                </button>
               ))}
             </div>
           </Panel>
@@ -325,7 +376,7 @@ export default function TrainerApp({ me, onLogout }) {
               <p className="px-2 py-3 text-xs text-neutral-500">Nema klijenta sa tim imenom.</p>
             )}
             {filteredClients.map((c) => (
-              <button key={c.id} onClick={() => { setSection("clients"); setSelectedClient(c.id); setTab("program"); }}
+              <button key={c.id} onClick={() => { if (section !== "reports") setSection("clients"); setSelectedClient(c.id); setTab("program"); }}
                 className={`w-full text-left px-2 py-2 rounded-lg text-sm font-bold border-2 ${selectedClient === c.id ? "bg-neutral-900 text-white border-neutral-900" : "bg-white border-neutral-200"}`}>
                 {c.name}
               </button>
@@ -345,7 +396,11 @@ export default function TrainerApp({ me, onLogout }) {
             >Izveštaji</button>
           </div>
           {section === "reports" ? (
-            <TrainerReports clients={clients} onResetReport={resetWorkoutReport} />
+            <TrainerReports
+              clients={clients}
+              onResetReport={resetWorkoutReport}
+              focusReport={notificationTarget}
+            />
           ) : !selectedClient ? (
             <Panel className="app-empty-state p-8 text-center text-neutral-400 font-mono">Izaberi klijenta sa leve strane i kreni sa planiranjem.</Panel>
           ) : (
@@ -505,89 +560,135 @@ function TrainerMembership({ client, clientName, adminName }) {
 function TrainerAttendance({ client }) {
   const [dates, setDates] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     let active = true;
     setLoading(true);
+    setError("");
     (async () => {
-      const [reports, weeks] = await Promise.all([
-        storeGet(`reports-${client}`),
-        getTrainingPrograms(client),
-      ]);
-      const submittedDates = new Set([
-        ...(reports || []).map((report) => dateIdFromTimestamp(report.date)),
-        ...(weeks || []).flatMap((week) => week.days.flatMap((day) =>
-          day.submittedAt ? [dateIdFromTimestamp(day.submittedAt)] : []
-        )),
-      ]);
-      if (active) {
-        setDates([...submittedDates]);
-        setLoading(false);
+      try {
+        const [reports, weeks] = await Promise.all([
+          getWorkoutReports(client),
+          getTrainingPrograms(client),
+        ]);
+        if (reports === null || weeks === null) {
+          throw new Error("Could not load workout attendance data.");
+        }
+        const submittedDates = new Set([
+          ...reports.map((report) => report.workout_date),
+          ...weeks.flatMap((week) => week.days.flatMap((day) =>
+            day.submittedAt ? [dateIdFromTimestamp(day.submittedAt)] : []
+          )),
+        ]);
+        if (active) setDates([...submittedDates]);
+      } catch (loadError) {
+        console.error("Could not load trainer attendance", client, loadError);
+        if (active) setError("Dolazci nisu mogli da se učitaju. Pokušaj ponovo.");
+      } finally {
+        if (active) setLoading(false);
       }
     })();
     return () => { active = false; };
   }, [client]);
 
   if (loading) return <p className="text-sm text-neutral-400">Učitavanje dolazaka...</p>;
+  if (error) return <p role="alert" className="text-sm font-semibold text-red-700">{error}</p>;
   return <AttendanceCalendar dates={dates} />;
 }
 
-function TrainerReports({ clients, onResetReport }) {
+function TrainerReports({ clients, onResetReport, focusReport }) {
   const [reports, setReports] = useState([]);
   const [loading, setLoading] = useState(true);
   const [resettingId, setResettingId] = useState(null);
   const [confirmResetId, setConfirmResetId] = useState(null);
+  const [expandedReportId, setExpandedReportId] = useState(null);
+  const [clientFilter, setClientFilter] = useState("");
   const [resetError, setResetError] = useState("");
+  const [resetWarning, setResetWarning] = useState("");
+  const [loadError, setLoadError] = useState("");
+
+  const filteredReports = clientFilter
+    ? reports.filter((report) => report.clientId === clientFilter)
+    : reports;
 
   useEffect(() => {
     let active = true;
     setLoading(true);
+    setLoadError("");
     (async () => {
-      const clientReports = await Promise.all(clients.map(async (client) => {
-        const [savedReports, weeks] = await Promise.all([
-          storeGet(`reports-${client.id}`),
-          getTrainingPrograms(client.id),
-        ]);
-        const archived = savedReports || [];
-        const archivedIds = new Set(archived.map((report) => report.id));
-        const previousSubmissions = (weeks || []).flatMap((week) =>
-          week.days.flatMap((day, dayIdx) => {
-            if (!day.submittedAt) return [];
-            const date = dateIdFromTimestamp(day.submittedAt);
-            const id = `${client.id}-${week.weekId}-${dayIdx}-${date}`;
-            if (archivedIds.has(id)) return [];
-            return [{
-              id,
-              clientId: client.id,
-              clientName: client.name,
-              weekId: week.weekId,
-              dayIdx,
-              date: day.submittedAt,
-              day: day.day,
-              exercises: day.exercises,
-            }];
-          })
-        );
-        return [...archived, ...previousSubmissions].map((report) => ({
-          ...report,
-          clientName: report.clientName || client.name,
+      try {
+        const clientReports = await Promise.all(clients.map(async (client) => {
+          const [savedReports, weeks] = await Promise.all([
+            getWorkoutReports(client.id),
+            getTrainingPrograms(client.id),
+          ]);
+          if (savedReports === null || weeks === null) {
+            throw new Error(`Could not load reports for client ${client.id}.`);
+          }
+          const archived = savedReports.map((report) => ({
+            ...report,
+            clientId: report.client_id,
+            clientName: client.name,
+            weekId: report.week_start,
+            dayIdx: report.day_index,
+            date: report.submitted_at,
+            day: report.day_name,
+            notificationId: `${report.client_id}-${report.week_start}-${report.day_index}-${report.workout_date}`,
+            isPersisted: true,
+          }));
+          const archivedDays = new Set(archived.map((report) =>
+            `${report.weekId}-${report.dayIdx}-${report.workout_date}`
+          ));
+          const previousSubmissions = weeks.flatMap((week) =>
+            week.days.flatMap((day, dayIdx) => {
+              if (!day.submittedAt) return [];
+              const date = dateIdFromTimestamp(day.submittedAt);
+              if (archivedDays.has(`${week.weekId}-${dayIdx}-${date}`)) return [];
+              const id = `${client.id}-${week.weekId}-${dayIdx}-${date}`;
+              return [{
+                id,
+                clientId: client.id,
+                clientName: client.name,
+                weekId: week.weekId,
+                dayIdx,
+                date: day.submittedAt,
+                day: day.day,
+                exercises: day.exercises,
+                notificationId: id,
+                isPersisted: false,
+              }];
+            })
+          );
+          return [...archived, ...previousSubmissions].map((report) => ({
+            ...report,
+            clientName: report.clientName || client.name,
+          }));
         }));
-      }));
-      if (active) {
-        setReports(clientReports.flat().sort((a, b) => new Date(b.date) - new Date(a.date)));
-        setLoading(false);
+        if (active) setReports(clientReports.flat().sort((a, b) => new Date(b.date) - new Date(a.date)));
+      } catch (loadError) {
+        console.error("Could not load trainer workout reports", loadError);
+        if (active) setLoadError("Izveštaji treninga nisu mogli da se učitaju. Pokušaj ponovo.");
+      } finally {
+        if (active) setLoading(false);
       }
     })();
     return () => { active = false; };
   }, [clients]);
 
+  useEffect(() => {
+    if (!focusReport) return;
+    setClientFilter(focusReport.clientId);
+    const report = reports.find((item) => item.id === focusReport.reportId);
+    if (report) setExpandedReportId(report.id);
+  }, [focusReport, reports]);
+
   if (loading) return <p className="text-sm text-neutral-400">Učitavanje izveštaja...</p>;
-  if (reports.length === 0 && !resetError) {
-    return <Panel className="p-8 text-center text-neutral-500">Još nema predatih treninga.</Panel>;
-  }
+  if (loadError) return <p role="alert" className="text-sm font-semibold text-red-700">{loadError}</p>;
 
   async function handleReset(report) {
     setResetError("");
+    setResetWarning("");
     setResettingId(report.id);
     try {
       const result = await onResetReport(report);
@@ -596,6 +697,7 @@ function TrainerReports({ clients, onResetReport }) {
         return;
       }
       setReports((current) => current.filter((item) => item.id !== report.id));
+      setResetWarning(result.warning || "");
       setConfirmResetId(null);
     } catch (error) {
       console.error("Could not reset workout report", error);
@@ -607,65 +709,96 @@ function TrainerReports({ clients, onResetReport }) {
 
   return (
     <div className="space-y-3">
-      {reports.length > 0 && <div className="mb-4 flex items-center justify-between">
-        <Header>Predati treninzi</Header>
-        <span className="app-progress-chip px-3 py-1 text-xs">{reports.length} izveštaja</span>
-      </div>}
+      <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <Header>Predati treninzi</Header>
+          <label className="block text-xs font-bold text-neutral-600">
+            Prikaži izveštaje
+            <select
+              className={inputCls + " min-w-52"}
+              value={clientFilter}
+              onChange={(event) => {
+                setClientFilter(event.target.value);
+                setExpandedReportId(null);
+                setConfirmResetId(null);
+              }}
+            >
+              <option value="">Svi klijenti</option>
+              {clients.map((client) => (
+                <option key={client.id} value={client.id}>{client.name}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <span className="app-progress-chip px-3 py-1 text-xs">{filteredReports.length} izveštaja</span>
+      </div>
       {resetError && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm font-semibold text-red-700">{resetError}</p>}
-      {reports.length === 0 && <Panel className="p-8 text-center text-neutral-500">Još nema predatih treninga.</Panel>}
-      {reports.map((report) => (
+      {resetWarning && <p role="status" className="rounded-lg bg-amber-50 p-3 text-sm font-semibold text-amber-900">{resetWarning}</p>}
+      {filteredReports.length === 0 && <Panel className="p-8 text-center text-neutral-500">Nema izveštaja za izabranog filtera.</Panel>}
+      {filteredReports.map((report) => (
         <Panel key={report.id} className="p-4">
-          <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <h3 className="font-bold text-[#19352c]">{report.clientName}</h3>
               <p className="mt-1 text-sm text-neutral-500">{report.day} · {new Date(report.date).toLocaleString("sr-RS")}</p>
             </div>
-            <div className="flex items-center gap-2">
-              <span className="rounded-full bg-green-50 px-2.5 py-1 text-xs font-bold text-green-800">Trening završen</span>
-              {confirmResetId === report.id ? (
-                <div className="w-full rounded-xl border border-red-200 bg-red-50 p-3">
-                  <p className="text-sm font-semibold text-red-900">
-                    Obrisaće se izveštaj i resetovati {report.day} za {report.clientName}.
-                  </p>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <Btn color="red" disabled={resettingId === report.id} onClick={() => handleReset(report)} className="text-xs">
-                      {resettingId === report.id ? "Resetujem..." : "Da, restartuj dan"}
-                    </Btn>
-                    <Btn color="ghost" disabled={resettingId === report.id} onClick={() => setConfirmResetId(null)} className="text-xs">
-                      Otkaži
-                    </Btn>
+            <Btn
+              color="ghost"
+              onClick={() => setExpandedReportId((current) => current === report.id ? null : report.id)}
+              className="text-xs"
+            >
+              {expandedReportId === report.id ? "Sakrij detalje" : "Prikaži detalje"}
+            </Btn>
+          </div>
+          {expandedReportId === report.id && (
+            <div className="mt-3 border-t border-neutral-100 pt-3">
+              <div className="space-y-2">
+                {report.exercises.map((exercise) => (
+                  <div key={exercise.id} className="rounded-xl bg-[#f6f8f5] p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="font-semibold">{exercise.name}</p>
+                      <span className={`shrink-0 text-xs font-bold ${exercise.done ? "text-green-700" : "text-neutral-400"}`}>
+                        {exercise.done ? "Urađeno" : "Nije urađeno"}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-sm text-neutral-600">
+                      {exercise.done
+                        ? `${exercise.actualWeight || exercise.weight} kg × ${exercise.actualReps || "-"} ponavljanja`
+                        : `Plan: ${exercise.weight} kg · ${exercise.repsMin}-${exercise.repsMax} ponavljanja`}
+                    </p>
+                    {exercise.note && <p className="mt-2 whitespace-pre-wrap text-sm text-neutral-500">Napomena: {exercise.note}</p>}
                   </div>
-                </div>
-              ) : (
-                <Btn
-                  color="red"
-                  disabled={resettingId === report.id}
-                  onClick={() => setConfirmResetId(report.id)}
-                  className="text-xs"
-                >
-                  Obriši i restartuj dan
-                </Btn>
-              )}
-            </div>
-          </div>
-          <div className="space-y-2">
-            {report.exercises.map((exercise) => (
-              <div key={exercise.id} className="rounded-xl bg-[#f6f8f5] p-3">
-                <div className="flex items-start justify-between gap-2">
-                  <p className="font-semibold">{exercise.name}</p>
-                  <span className={`shrink-0 text-xs font-bold ${exercise.done ? "text-green-700" : "text-neutral-400"}`}>
-                    {exercise.done ? "Urađeno" : "Nije urađeno"}
-                  </span>
-                </div>
-                <p className="mt-1 text-sm text-neutral-600">
-                  {exercise.done
-                    ? `${exercise.actualWeight || exercise.weight} kg × ${exercise.actualReps || "-"} ponavljanja`
-                    : `Plan: ${exercise.weight} kg · ${exercise.repsMin}-${exercise.repsMax} ponavljanja`}
-                </p>
-                {exercise.note && <p className="mt-2 whitespace-pre-wrap text-sm text-neutral-500">Napomena: {exercise.note}</p>}
+                ))}
               </div>
-            ))}
-          </div>
+              <div className="mt-3 flex justify-end">
+                {confirmResetId === report.id ? (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-neutral-600">Potvrdi brisanje?</span>
+                    <button
+                      type="button"
+                      disabled={resettingId === report.id}
+                      onClick={() => handleReset(report)}
+                      className="rounded-md bg-red-600 px-3 py-1.5 text-xs font-bold text-white transition hover:bg-red-700 disabled:opacity-50"
+                    >
+                      {resettingId === report.id ? "Resetujem..." : "Potvrdi"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={resettingId === report.id}
+                      onClick={() => setConfirmResetId(null)}
+                      className="rounded-md px-2 py-1.5 text-xs font-semibold text-neutral-600 transition hover:bg-neutral-100 disabled:opacity-50"
+                    >
+                      Otkaži
+                    </button>
+                  </div>
+                ) : (
+                  <Btn color="red" disabled={resettingId === report.id} onClick={() => setConfirmResetId(report.id)} className="text-xs">
+                    Obriši izveštaj i restartuj dan
+                  </Btn>
+                )}
+              </div>
+            </div>
+          )}
         </Panel>
       ))}
     </div>

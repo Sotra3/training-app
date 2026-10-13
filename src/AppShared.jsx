@@ -73,7 +73,7 @@ function youtubeEmbed(url) {
   return id ? `https://www.youtube.com/embed/${id}` : null;
 }
 
-async function compressImage(file, maxDim = 500, quality = 0.6) {
+async function compressImage(file, maxDim = 1200, quality = 0.75) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -84,8 +84,19 @@ async function compressImage(file, maxDim = 500, quality = 0.6) {
         else if (h > maxDim) { w = (w * maxDim) / h; h = maxDim; }
         const canvas = document.createElement("canvas");
         canvas.width = w; canvas.height = h;
-        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL("image/jpeg", quality));
+        const context = canvas.getContext("2d");
+        if (!context) {
+          reject(new Error("Could not prepare image for upload."));
+          return;
+        }
+        context.drawImage(img, 0, 0, w, h);
+        canvas.toBlob((blob) => {
+          if (!blob) {
+            reject(new Error("Could not compress image."));
+            return;
+          }
+          resolve(blob);
+        }, "image/jpeg", quality);
       };
       img.onerror = reject;
       img.src = e.target.result;
@@ -111,7 +122,9 @@ function Header({ children }) {
   );
 }
 function WeightHistory({ bodylog }) {
-  const entries = bodylog.slice().sort((a, b) => b.date.localeCompare(a.date));
+  const entries = bodylog.slice().sort((a, b) =>
+    (b.measured_at || b.date).localeCompare(a.measured_at || a.date)
+  );
   return (
     <div className="mt-4 border-t border-neutral-100 pt-4">
       <h3 className="mb-2 text-sm font-bold text-[#19352c]">Istorija merenja</h3>
@@ -120,9 +133,9 @@ function WeightHistory({ bodylog }) {
       ) : (
         <div className="max-h-72 space-y-2 overflow-y-auto">
           {entries.map((entry, index) => (
-            <div key={`${entry.date}-${index}`} className="flex items-start justify-between gap-3 rounded-xl bg-[#f6f8f5] px-3 py-2">
+            <div key={entry.id || `${entry.measured_at || entry.date}-${index}`} className="flex items-start justify-between gap-3 rounded-xl bg-[#f6f8f5] px-3 py-2">
               <div>
-                <p className="text-sm font-bold text-[#19352c]">{new Date(`${entry.date}T00:00:00`).toLocaleDateString("sr-RS")}</p>
+                <p className="text-sm font-bold text-[#19352c]">{new Date(`${entry.measured_at || entry.date}T00:00:00`).toLocaleDateString("sr-RS")}</p>
                 {entry.note && <p className="mt-0.5 whitespace-pre-wrap text-xs text-neutral-500">{entry.note}</p>}
               </div>
               <span className="shrink-0 font-mono text-sm font-bold">{entry.weight} kg</span>

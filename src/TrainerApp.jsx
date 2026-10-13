@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { Dumbbell, User, Users, Calendar, Utensils, TrendingUp, Camera, Bell, Plus, Trash2, ChevronRight, ChevronLeft, LogOut, Mail, RefreshCw, Video, X, ArrowUp, Edit3, Save, Lock, Search } from "lucide-react";
-import { storeGet, storeSet } from "./lib/storage";
-import { getClientNutrition, updateClientNutritionPlan } from "./lib/profiles";
+import { getClientMembership, getClientNutrition, updateClientMembership, updateClientNutritionPlan } from "./lib/profiles";
 import { supabase } from "./lib/supabaseClient";
 import { getTrainingProgram, getTrainingPrograms, saveTrainingProgram } from "./lib/training_programs";
 import { getWorkoutReports, deleteWorkoutReport } from "./lib/workout_reports";
+import { getBodyMeasurements } from "./lib/body_measurements";
 import { getNotifications, deleteNotifications } from "./lib/notifications";
+import { deleteProgressPhoto, getProgressPhotos } from "./lib/photos";
 import Field from "./Field";
 import AttendanceCalendar from "./AttendanceCalendar";
 import { DAYS, DAY_SHORT, todayIndex, isoMonday, formatWeekRange, localDateId, addCalendarMonth, dateIdFromTimestamp, emptyWeek, newExercise, youtubeEmbed, compressImage, Panel, Header, WeightHistory, Btn, inputCls } from "./AppShared";
@@ -414,7 +415,7 @@ export default function TrainerApp({ me, onLogout }) {
               {tab === "ishrana" && <TrainerNutrition clientId={selectedClient} />}
               {tab === "napredak" && <TrainerProgress client={selectedClient} />}
               {tab === "dolasci" && <TrainerAttendance client={selectedClient} />}
-              {tab === "clanarina" && <TrainerMembership client={selectedClient} clientName={clients.find((client) => client.id === selectedClient)?.name} adminName={me.name} />}
+              {tab === "clanarina" && <TrainerMembership client={selectedClient} clientName={clients.find((client) => client.id === selectedClient)?.name} />}
             </>
           )}
         </div>
@@ -423,7 +424,7 @@ export default function TrainerApp({ me, onLogout }) {
   );
 }
 
-function TrainerMembership({ client, clientName, adminName }) {
+function TrainerMembership({ client, clientName }) {
   const [membership, setMembership] = useState(null);
   const [dateDraft, setDateDraft] = useState("");
   const [loading, setLoading] = useState(true);
@@ -436,56 +437,55 @@ function TrainerMembership({ client, clientName, adminName }) {
     setLoading(true);
     setError("");
     (async () => {
-      const saved = await storeGet(`membership-${client}`);
+      const saved = await getClientMembership(client);
       if (active) {
-        setMembership(saved || { paidUntil: "", history: [] });
-        setDateDraft(saved?.paidUntil || "");
+        if (saved === null) {
+          setError("Članarina nije mogla da se učita. Pokušaj ponovo.");
+        } else {
+          setMembership(saved);
+          setDateDraft(saved);
+        }
         setLoading(false);
       }
     })();
     return () => { active = false; };
   }, [client]);
 
-  async function savePaidUntil(paidUntil, action) {
+  async function savePaidUntil(paidUntil) {
     setError("");
     setSuccess("");
     setSaving(true);
-    const previous = membership || { paidUntil: "", history: [] };
-    const updated = {
-      paidUntil,
-      history: [{
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        changedAt: new Date().toISOString(),
-        changedBy: adminName,
-        previousUntil: previous.paidUntil || null,
-        newUntil: paidUntil || null,
-        action,
-      }, ...(previous.history || [])],
-    };
-    const saved = await storeSet(`membership-${client}`, updated);
-    setSaving(false);
-    if (!saved) {
-      setError("Nije moguće sačuvati članarinu. Proveri vezu i pokušaj ponovo.");
+    try {
+      const saved = await updateClientMembership(client, paidUntil);
+      if (!saved) {
+        setError("Članarina nije sačuvana. Proveri vezu i pokušaj ponovo.");
+        return false;
+      }
+      setMembership(paidUntil);
+      setDateDraft(paidUntil);
+      setSuccess("Članarina je ažurirana.");
+      return true;
+    } catch (saveError) {
+      console.error("Could not update client membership", client, saveError);
+      setError("Članarina nije sačuvana. Proveri vezu i pokušaj ponovo.");
       return false;
+    } finally {
+      setSaving(false);
     }
-    setMembership(updated);
-    setDateDraft(paidUntil);
-    setSuccess("Članarina je ažurirana.");
-    return true;
   }
 
   async function extendOneMonth() {
     const today = localDateId();
-    const start = membership?.paidUntil && membership.paidUntil >= today
-      ? membership.paidUntil
+    const start = membership && membership >= today
+      ? membership
       : today;
-    await savePaidUntil(addCalendarMonth(start), "Produženo za mesec dana");
+    await savePaidUntil(addCalendarMonth(start));
   }
 
   if (loading) return <p className="text-sm text-neutral-400">Učitavanje članarine...</p>;
 
   const today = localDateId();
-  const active = Boolean(membership?.paidUntil && membership.paidUntil >= today);
+  const active = Boolean(membership && membership >= today);
 
   return (
     <div className="space-y-4">
@@ -493,7 +493,7 @@ function TrainerMembership({ client, clientName, adminName }) {
         <Header>Članarina - {clientName || "klijent"}</Header>
         <p className={`mb-4 text-sm font-bold ${active ? "text-green-700" : "text-orange-700"}`}>
           {active
-            ? `Aktivna do ${new Date(`${membership.paidUntil}T00:00:00`).toLocaleDateString("sr-RS")}`
+            ? `Aktivna do ${new Date(`${membership}T00:00:00`).toLocaleDateString("sr-RS")}`
             : "Nema aktivne članarine"}
         </p>
         <Btn color="green" onClick={extendOneMonth} disabled={saving} className="w-full sm:w-auto">
@@ -511,13 +511,13 @@ function TrainerMembership({ client, clientName, adminName }) {
           </label>
           <div className="mt-2 flex flex-wrap gap-2">
             <Btn
-              onClick={() => savePaidUntil(dateDraft, "Ručno podešen datum")}
+              onClick={() => savePaidUntil(dateDraft)}
               disabled={saving || !dateDraft}
             >Sačuvaj datum</Btn>
-            {membership?.paidUntil && (
+            {membership && (
               <Btn
                 color="ghost"
-                onClick={() => savePaidUntil("", "Članarina uklonjena")}
+                onClick={() => savePaidUntil("")}
                 disabled={saving}
               >Ukloni članarinu</Btn>
             )}
@@ -525,33 +525,6 @@ function TrainerMembership({ client, clientName, adminName }) {
         </div>
         {error && <p role="alert" className="mt-3 text-sm font-semibold text-red-700">{error}</p>}
         {success && <p role="status" className="mt-3 text-sm font-semibold text-green-700">{success}</p>}
-      </Panel>
-
-      <Panel className="p-4">
-        <Header>Istorija članarine</Header>
-        {!membership?.history?.length ? (
-          <p className="text-sm text-neutral-500">Još nema izmena članarine.</p>
-        ) : (
-          <div className="space-y-2">
-            {membership.history.map((entry) => (
-              <div key={entry.id} className="rounded-xl bg-[#f6f8f5] p-3 text-sm">
-                <p className="font-bold">{entry.action}</p>
-                <p className="mt-1 text-neutral-600">
-                  {entry.previousUntil
-                    ? new Date(`${entry.previousUntil}T00:00:00`).toLocaleDateString("sr-RS")
-                    : "Nije aktivna"}
-                  {" → "}
-                  {entry.newUntil
-                    ? new Date(`${entry.newUntil}T00:00:00`).toLocaleDateString("sr-RS")
-                    : "Nije aktivna"}
-                </p>
-                <p className="mt-1 text-xs text-neutral-500">
-                  {new Date(entry.changedAt).toLocaleString("sr-RS")} · {entry.changedBy}
-                </p>
-              </div>
-            ))}
-          </div>
-        )}
       </Panel>
     </div>
   );
@@ -1119,23 +1092,59 @@ function TrainerProgress({ client }) {
   const [bodylog, setBodylog] = useState([]);
   const [photos, setPhotos] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [measurementError, setMeasurementError] = useState("");
+  const [photosError, setPhotosError] = useState("");
+  const [deletingPhotoId, setDeletingPhotoId] = useState(null);
 
   useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setMeasurementError("");
+    setPhotosError("");
     (async () => {
-      const [b, p] = await Promise.all([storeGet(`bodylog-${client}`), storeGet(`photos-${client}`)]);
-      setBodylog(b || []);
+      const [measurements, p] = await Promise.all([
+        getBodyMeasurements(client),
+        getProgressPhotos(client),
+      ]);
+      if (!active) return;
+      setBodylog(measurements || []);
       setPhotos(p || []);
+      if (measurements === null) setMeasurementError("Merenja nisu mogla da se učitaju.");
+      if (p === null) setPhotosError("Fotografije napretka nisu mogle da se učitaju.");
       setLoading(false);
     })();
+    return () => { active = false; };
   }, [client]);
 
   if (loading) return <p className="text-xs text-neutral-400 font-mono">Učitavanje...</p>;
-  const chartData = bodylog.map((b) => ({ date: b.date.slice(5), kg: parseFloat(b.weight) }));
+  const chartData = bodylog.slice().reverse().map((measurement) => ({
+    date: measurement.measured_at.slice(5),
+    kg: parseFloat(measurement.weight),
+  }));
+
+  async function handleDeletePhoto(photo) {
+    setPhotosError("");
+    setDeletingPhotoId(photo.id);
+    try {
+      const deleted = await deleteProgressPhoto(photo);
+      if (!deleted) {
+        setPhotosError("Fotografija nije obrisana. Proveri dozvole i pokušaj ponovo.");
+        return;
+      }
+      setPhotos((current) => current.filter((item) => item.id !== photo.id));
+    } catch (error) {
+      console.error("Could not delete client progress photo", photo.id, error);
+      setPhotosError("Fotografija nije obrisana. Proveri dozvole i pokušaj ponovo.");
+    } finally {
+      setDeletingPhotoId(null);
+    }
+  }
 
   return (
     <div className="space-y-3">
       <Panel className="p-3">
         <Header>Telesna težina</Header>
+        {measurementError && <p role="alert" className="mb-2 text-sm font-semibold text-red-700">{measurementError}</p>}
         {chartData.length > 0 ? (
           <div className="h-40">
             <ResponsiveContainer width="100%" height="100%">
@@ -1153,11 +1162,22 @@ function TrainerProgress({ client }) {
       </Panel>
       <Panel className="p-3">
         <Header>Fotografije napretka</Header>
+        {photosError && <p role="alert" className="mb-2 text-sm font-semibold text-red-700">{photosError}</p>}
         {photos.length === 0 ? <p className="text-xs text-neutral-400 font-mono">Nema fotografija još.</p> : (
           <div className="grid grid-cols-4 gap-2">
             {photos.slice().reverse().map((p, i) => (
-              <div key={i} className="text-center">
-                <img src={p.img} className="rounded-lg border-2 border-neutral-900 aspect-square object-cover" />
+              <div key={p.id || i} className="relative text-center">
+                <img src={p.img} alt="Fotografija napretka klijenta" className="rounded-lg border-2 border-neutral-900 aspect-square object-cover" />
+                <button
+                  type="button"
+                  onClick={() => handleDeletePhoto(p)}
+                  disabled={deletingPhotoId === p.id}
+                  aria-label="Obriši fotografiju klijenta"
+                  title="Obriši fotografiju"
+                  className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-full bg-red-600 text-white shadow transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <X size={15} />
+                </button>
                 <p className="text-[9px] font-mono text-neutral-500 mt-1">{p.date}</p>
               </div>
             ))}

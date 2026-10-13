@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { Dumbbell, User, Users, Calendar, Utensils, TrendingUp, Camera, Bell, Plus, Trash2, ChevronRight, ChevronLeft, LogOut, Mail, RefreshCw, Video, X, ArrowUp, Edit3, Save, Lock } from "lucide-react";
-import { storeGet, storeSet } from "./lib/storage";
 import { supabase } from "./lib/supabaseClient";
-import { getClientNutrition } from "./lib/profiles";
+import { getClientMembership, getClientNutrition } from "./lib/profiles";
 import { getTrainingProgram, getTrainingPrograms } from "./lib/training_programs";
 import { getWorkoutReports, submitWorkoutReport } from "./lib/workout_reports";
+import { getBodyMeasurements, addBodyMeasurement } from "./lib/body_measurements";
 import { createNotification } from "./lib/notifications";
+import { addProgressPhoto, deleteProgressPhoto, getProgressPhotos } from "./lib/photos";
 import AttendanceCalendar from "./AttendanceCalendar";
 import { DAYS, DAY_SHORT, todayIndex, isoMonday, formatWeekRange, localDateId, addCalendarMonth, dateIdFromTimestamp, emptyWeek, newExercise, youtubeEmbed, compressImage, Panel, Header, WeightHistory, Btn, inputCls } from "./AppShared";
 
@@ -19,21 +20,28 @@ export default function ClientApp({ me, onLogout }) {
   const [photos, setPhotos] = useState([]);
   const [adminId, setAdminId] = useState(null);
   const [membership, setMembership] = useState(null);
+  const [membershipError, setMembershipError] = useState("");
+  const [bodyMeasurementsError, setBodyMeasurementsError] = useState("");
+  const [progressPhotosError, setProgressPhotosError] = useState("");
   const [attendanceDates, setAttendanceDates] = useState([]);
   const [loading, setLoading] = useState(true);
   const [exerciseUpdates, setExerciseUpdates] = useState({});
 
   async function loadAll() {
     setLoading(true);
-    const [progs, nutr, blog, phs, adminRow, savedReports, savedMembership] = await Promise.all([
+    setProgressPhotosError("");
+    const [progs, nutr, blog, adminRow, savedReports, savedMembership] = await Promise.all([
       getTrainingPrograms(me.id),
       getClientNutrition(me.id),
-      storeGet(`bodylog-${me.id}`),
-      storeGet(`photos-${me.id}`),
+      getBodyMeasurements(me.id),
       supabase.from("profiles").select("id").eq("role", "admin").limit(1).maybeSingle(),
       getWorkoutReports(me.id),
-      storeGet(`membership-${me.id}`),
+      getClientMembership(me.id),
     ]);
+    const savedPhotos = await getProgressPhotos(me.id);
+    if (savedPhotos === null) {
+      setProgressPhotosError("Fotografije napretka nisu mogle da se učitaju.");
+    }
     const weeks = progs || [];
     const currentWeekId = isoMonday();
     const currentWeek = weeks.find((week) => week.weekId === currentWeekId);
@@ -51,9 +59,11 @@ export default function ClientApp({ me, onLogout }) {
     setProgram(cur);
     setNutrition(nutr);
     setBodylog(blog || []);
-    setPhotos(phs || []);
+    setBodyMeasurementsError(blog === null ? "Merenja nisu mogla da se učitaju." : "");
+    setPhotos(savedPhotos || []);
     setAdminId(adminRow?.data?.id || null);
     setMembership(savedMembership);
+    setMembershipError(savedMembership === null ? "Podaci o članarini nisu mogli da se učitaju." : "");
     const submittedDates = new Set([
       ...(savedReports || []).map((report) => report.workout_date),
       ...weeks.flatMap((week) => week.days.flatMap((day) =>
@@ -161,17 +171,26 @@ export default function ClientApp({ me, onLogout }) {
   }
 
   async function addBodylog(entry) {
-    const list = await storeGet(`bodylog-${me.id}`) || [];
-    list.push({ ...entry, date: localDateId() });
-    await storeSet(`bodylog-${me.id}`, list);
-    setBodylog(list);
+    const savedMeasurement = await addBodyMeasurement(Number(entry.weight), entry.note || "");
+    if (!savedMeasurement) return null;
+
+    const measurement = { ...savedMeasurement, date: savedMeasurement.measured_at };
+    setBodylog((current) => [measurement, ...current]);
+    return measurement;
   }
 
-  async function addPhoto(imgData, note) {
-    const list = await storeGet(`photos-${me.id}`) || [];
-    list.push({ date: localDateId(), img: imgData, note });
-    await storeSet(`photos-${me.id}`, list);
-    setPhotos(list);
+  async function addPhoto(image, note) {
+    const photo = await addProgressPhoto(me.id, image, note, localDateId());
+    if (!photo) return null;
+    setPhotos((current) => [photo, ...current]);
+    return photo;
+  }
+
+  async function removePhoto(photo) {
+    const deleted = await deleteProgressPhoto(photo);
+    if (!deleted) return false;
+    setPhotos((current) => current.filter((item) => item.id !== photo.id));
+    return true;
   }
 
   if (loading) return <div className="min-h-screen flex items-center justify-center font-mono text-neutral-400">Učitavanje...</div>;
@@ -184,7 +203,7 @@ export default function ClientApp({ me, onLogout }) {
     { key: "napredak", label: "Napredak", icon: <TrendingUp size={16} /> },
   ];
   const today = localDateId();
-  const paidUntil = membership?.paidUntil || "";
+  const paidUntil = membership || "";
   const membershipDaysLeft = paidUntil
     ? Math.ceil((new Date(`${paidUntil}T00:00:00`) - new Date(`${today}T00:00:00`)) / 86400000)
     : null;
@@ -200,6 +219,7 @@ export default function ClientApp({ me, onLogout }) {
       </div>
 
       <div className="app-content max-w-2xl mx-auto p-4">
+        {membershipError && <p role="alert" className="mb-3 rounded-lg bg-red-50 p-3 text-sm font-semibold text-red-700">{membershipError}</p>}
         {membershipActive ? (
           <>
             <MembershipNotice paidUntil={paidUntil} daysLeft={membershipDaysLeft} />
@@ -235,7 +255,7 @@ export default function ClientApp({ me, onLogout }) {
         )}
         {tab === "dolasci" && <AttendanceCalendar dates={attendanceDates} />}
         {tab === "ishrana" && <ClientNutrition nutrition={nutrition} />}
-            {tab === "napredak" && <ClientProgress bodylog={bodylog} photos={photos} onAddLog={addBodylog} onAddPhoto={addPhoto} />}
+            {tab === "napredak" && <ClientProgress bodylog={bodylog} photos={photos} onAddLog={addBodylog} onAddPhoto={addPhoto} onDeletePhoto={removePhoto} measurementError={bodyMeasurementsError} photosError={progressPhotosError} />}
           </>
         ) : (
           <Panel className="p-6 text-center">
@@ -505,21 +525,83 @@ function ClientNutrition({ nutrition }) {
   );
 }
 
-function ClientProgress({ bodylog, photos, onAddLog, onAddPhoto }) {
+function ClientProgress({ bodylog, photos, onAddLog, onAddPhoto, onDeletePhoto, measurementError, photosError }) {
   const [weight, setWeight] = useState("");
   const [note, setNote] = useState("");
+  const [savingMeasurement, setSavingMeasurement] = useState(false);
+  const [measurementSaveError, setMeasurementSaveError] = useState("");
   const fileRef = useRef();
   const [photoNote, setPhotoNote] = useState("");
+  const [savingPhoto, setSavingPhoto] = useState(false);
+  const [photoSaveError, setPhotoSaveError] = useState("");
+  const [deletingPhotoId, setDeletingPhotoId] = useState(null);
 
-  const chartData = bodylog.map((b) => ({ date: b.date.slice(5), kg: parseFloat(b.weight) }));
+  const chartData = bodylog.slice().reverse().map((measurement) => {
+    const measuredAt = measurement.measured_at || measurement.date;
+    return { date: measuredAt.slice(5), kg: parseFloat(measurement.weight) };
+  });
+
+  async function handleAddMeasurement() {
+    const parsedWeight = Number(weight);
+    if (!Number.isFinite(parsedWeight) || parsedWeight <= 0) {
+      setMeasurementSaveError("Unesi ispravnu težinu.");
+      return;
+    }
+
+    setMeasurementSaveError("");
+    setSavingMeasurement(true);
+    let savedMeasurement;
+    try {
+      savedMeasurement = await onAddLog({ weight: parsedWeight, note });
+    } catch (error) {
+      console.error("Could not save body measurement", error);
+      setMeasurementSaveError("Merenje nije sačuvano. Proveri vezu i pokušaj ponovo.");
+      return;
+    } finally {
+      setSavingMeasurement(false);
+    }
+    if (!savedMeasurement) {
+      setMeasurementSaveError("Merenje nije sačuvano. Proveri vezu i pokušaj ponovo.");
+      return;
+    }
+    setWeight("");
+    setNote("");
+  }
 
   async function handlePhoto(e) {
     const file = e.target.files[0];
     if (!file) return;
-    const data = await compressImage(file);
-    await onAddPhoto(data, photoNote);
-    setPhotoNote("");
-    e.target.value = "";
+    setPhotoSaveError("");
+    setSavingPhoto(true);
+    try {
+      const image = await compressImage(file);
+      const savedPhoto = await onAddPhoto(image, photoNote);
+      if (!savedPhoto) {
+        setPhotoSaveError("Fotografija nije sačuvana. Proveri vezu i pokušaj ponovo.");
+        return;
+      }
+      setPhotoNote("");
+      e.target.value = "";
+    } catch (error) {
+      console.error("Could not prepare progress photo", error);
+      setPhotoSaveError("Fotografija nije mogla da se obradi. Pokušaj sa drugom slikom.");
+    } finally {
+      setSavingPhoto(false);
+    }
+  }
+
+  async function handleDeletePhoto(photo) {
+    setPhotoSaveError("");
+    setDeletingPhotoId(photo.id);
+    try {
+      const deleted = await onDeletePhoto(photo);
+      if (!deleted) setPhotoSaveError("Fotografija nije obrisana. Proveri vezu i pokušaj ponovo.");
+    } catch (error) {
+      console.error("Could not delete progress photo", photo.id, error);
+      setPhotoSaveError("Fotografija nije obrisana. Proveri vezu i pokušaj ponovo.");
+    } finally {
+      setDeletingPhotoId(null);
+    }
   }
 
   return (
@@ -527,9 +609,11 @@ function ClientProgress({ bodylog, photos, onAddLog, onAddPhoto }) {
       <Panel className="p-4">
         <Header>Unesi telesnu težinu</Header>
         <div className="flex gap-2 mb-2">
-          <input className={inputCls} placeholder="kg" value={weight} onChange={(e) => setWeight(e.target.value)} />
-          <Btn color="green" onClick={() => { if (weight) { onAddLog({ weight, note }); setWeight(""); setNote(""); } }}>Sačuvaj</Btn>
+          <input type="number" min="0" step="0.1" className={inputCls} placeholder="kg" value={weight} onChange={(e) => setWeight(e.target.value)} />
+          <Btn color="green" onClick={handleAddMeasurement} disabled={savingMeasurement}>{savingMeasurement ? "Čuvam..." : "Sačuvaj"}</Btn>
         </div>
+        {measurementError && <p role="alert" className="mb-2 text-sm font-semibold text-red-700">{measurementError}</p>}
+        {measurementSaveError && <p role="alert" className="mb-2 text-sm font-semibold text-red-700">{measurementSaveError}</p>}
         <input
           className={inputCls}
           placeholder="Napomena uz merenje (opciono)"
@@ -555,11 +639,35 @@ function ClientProgress({ bodylog, photos, onAddLog, onAddPhoto }) {
       <Panel className="p-4">
         <Header>Nedeljna fotografija</Header>
         <input className={inputCls + " mb-2"} placeholder="napomena (opciono)" value={photoNote} onChange={(e) => setPhotoNote(e.target.value)} />
-        <input type="file" accept="image/*" ref={fileRef} onChange={handlePhoto} className="text-xs" />
+        <label className={`app-button inline-flex cursor-pointer items-center gap-2 rounded-lg bg-[#2F6FB0] px-4 py-2.5 text-sm font-bold text-white transition hover:bg-[#255a8f] ${savingPhoto ? "cursor-not-allowed opacity-40" : ""}`}>
+          <Camera size={17} />
+          {savingPhoto ? "Čuvam fotografiju..." : "Izaberi fotografiju"}
+          <input
+            type="file"
+            accept="image/*"
+            ref={fileRef}
+            onChange={handlePhoto}
+            disabled={savingPhoto}
+            className="sr-only"
+          />
+        </label>
+        {savingPhoto && <p className="mt-2 text-xs text-neutral-500">Čuvam fotografiju...</p>}
+        {photosError && <p role="alert" className="mt-2 text-sm font-semibold text-red-700">{photosError}</p>}
+        {photoSaveError && <p role="alert" className="mt-2 text-sm font-semibold text-red-700">{photoSaveError}</p>}
         <div className="grid grid-cols-3 gap-2 mt-3">
           {photos.slice().reverse().map((p, i) => (
-            <div key={i} className="text-center">
-              <img src={p.img} className="rounded-lg border-2 border-neutral-900 aspect-square object-cover" />
+            <div key={p.id || i} className="relative text-center">
+              <img src={p.img} alt="Fotografija napretka" className="rounded-lg border-2 border-neutral-900 aspect-square object-cover" />
+              <button
+                type="button"
+                onClick={() => handleDeletePhoto(p)}
+                disabled={deletingPhotoId === p.id || savingPhoto}
+                aria-label="Obriši fotografiju"
+                title="Obriši fotografiju"
+                className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-full bg-red-600 text-white shadow transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <X size={15} />
+              </button>
               <p className="text-[10px] font-mono text-neutral-500 mt-1">{p.date}</p>
             </div>
           ))}

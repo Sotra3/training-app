@@ -23,7 +23,7 @@ export async function getClientMembership(clientId) {
     console.error("getClientMembership error", clientId, error);
     return null;
   }
-  return data?.membership ?? null;
+  return data?.membership ?? "";
 }
 
 export async function updateClientNutritionPlan(clientId, nutritionPlan) {
@@ -43,10 +43,12 @@ export async function updateClientMembership(clientId, membershipDate) {
   const { data, error } = await supabase
     .from("profiles")
     .update({ membership: membershipDate || null })
-    .eq("id", clientId);
+    .eq("id", clientId)
+    .select("id")
+    .maybeSingle();
   if (error) {
     console.error("updateClientMembership error", clientId, error);
-    return null;
+    return false;
   }
-  return data ? data : null;
+  return Boolean(data);
 }

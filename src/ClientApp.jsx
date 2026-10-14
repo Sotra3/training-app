@@ -350,7 +350,7 @@ function ClientDayDetail({ program, dayIdx, locked, exerciseUpdates, onUpdateExe
     }
   }
 
-  if (!program) return <Panel className="p-6 text-center text-neutral-400 font-mono">Trener ti još nije napravio program za ovu nedelju.</Panel>;
+  if (!program) return <Panel className="p-6 text-center text-neutral-400 font-mono">Trener ti još nije napravio program.</Panel>;
 
   const Back = () => onBack ? (
     <button onClick={onBack} className="flex items-center gap-1 text-xs font-bold text-neutral-500 mb-2">
@@ -361,7 +361,7 @@ function ClientDayDetail({ program, dayIdx, locked, exerciseUpdates, onUpdateExe
   if (!day || day.exercises.length === 0) return (
     <div>
       <Back />
-      <Panel className="p-6 text-center text-neutral-400 font-mono">{DAYS[dayIdx]} - nema zakazanih vežbi. Odmor 💪</Panel>
+      <Panel className="p-6 text-center text-neutral-400 font-mono">{DAYS[dayIdx]} - nema zakazanih vežbi. Odmor</Panel>
     </div>
   );
 
